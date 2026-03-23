@@ -1,0 +1,64 @@
+# ColaMem Training Configuration - Phase 2
+# 视觉问答任务（VQA/Reasoning）
+
+# 模型配置
+model:
+  model_path: "./outputs/colamem_phase1/model"  # 从 Phase 1 加载（与 train.py 保存路径一致）
+  num_mem_tokens: 64
+  num_work_tokens: 32
+  gradient_checkpointing: true
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  
+  # 高级特性（Phase 2 通常不需要重新初始化）
+  use_semantic_init: false         # Phase 2 继承 Phase 1 的初始化
+  lambda_orth: 0.02                # Phase 2 使用更小的正交正则化权重
+
+# 数据配置
+data:
+  train_json: "data/phase2_train.json"
+  eval_json: "data/phase2_eval.json"
+
+# 训练配置
+training:
+  output_dir: "./outputs/colamem_phase2"
+  
+  # 训练参数
+  num_epochs: 3
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  
+  # 优化器参数（Phase 2 使用更小的学习率）
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  
+  # 精度参数
+  bf16: true
+  fp16: false
+  
+  # 日志参数
+  logging_steps: 10
+  
+  # 保存参数
+  save_steps: 500
+  save_total_limit: 2
+  eval_steps: 500
+  
+  # 数据加载参数
+  num_workers: 4
+  
+  # DeepSpeed 配置
+  deepspeed_config: "configs/ds_zero3_config.json"
+  
+  # 报告工具
+  report_to: ["tensorboard"]
+  
+  # 语义漂移监控（高级特性）
+  monitor_drift_every_n_steps: 100  # 每 100 步监控一次语义漂移
+  save_drift_report: true           # 保存漂移报告
+
+# 随机种子
+seed: 42

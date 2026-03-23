@@ -1,0 +1,113 @@
+# ColaMem Training Configuration - Phase 1
+# 图像描述重建任务（Captioning/Reconstruction）
+# 
+# ⚠️ Phase 1 训练策略核心要点：
+# 1. 只跑 1 个 Epoch，防止过拟合（变成复读机）
+# 2. 冻结 Decoder (Solver)，强迫 Projector 适应 Solver
+# 3. 目标：Loss 从 ~2.0 降到 ~0.8，模型能大致说对图片内容
+# 4. 不追求完美语法，只要不复读、不乱码即可
+
+# 模型配置
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"  
+  # [Phase 1 修复] 基础模型路径，用于加载 Vision Encoder 预训练权重
+  # 如果不设置，默认使用 model_path
+  base_model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  num_mem_tokens: 64               
+  num_work_tokens: 32              
+  
+  # [Phase 1 专用] 禁用 Workspace（强烈推荐！）
+  # 原因：
+  #   - Phase 1 是简单的 Captioning 任务，不需要"草稿纸"进行推理
+  #   - 禁用 Workspace 可以简化学习目标，让 Projector 专注于对齐
+  #   - 减少参数量（~131K），避免梯度稀释
+  #   - 防止模型走捷径（把信息存在 workspace 而非 latent_memory）
+  # Phase 2/3 可启用 Workspace 进行复杂推理
+  use_workspace: false
+  
+  # [重要修复] 禁用 gradient_checkpointing
+  # 原因：Qwen3-VL 的 M-RoPE 缓存机制与 gradient checkpointing 不兼容
+  # 错误表现：forward 时 RoPE 缓存 [4096] -> recompute 时变成 [0]
+  # Phase 1 已冻结 Vision Encoder 和 Decoder，显存压力不大，可以安全禁用
+  gradient_checkpointing: false     
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  
+  # [重要] 冻结 Vision Encoder（推荐开启）
+  # 优势：避免权重加载问题、节省显存、加快训练、保留预训练视觉能力
+  freeze_vision_encoder: true
+  
+  # [Phase 1 专用] 冻结 Decoder/Solver（强烈推荐！）
+  # 核心原理：强迫 Projector 去适应 Solver，而不是让 Solver 变傻来适应 Projector
+  # 优势：
+  #   - 防止 Decoder 过拟合（变成复读机）
+  #   - 保留 Decoder 的预训练生成能力
+  #   - 大幅减少可训练参数 (~8.77B -> 0)，节省显存
+  freeze_decoder: true
+
+  use_semantic_init: true          # 多样化语义初始化（统一概念词池，无分组）
+  lambda_orth: 0.1                 # 正交正则化权重（防止模式坍塌）
+
+  # [Phase 1 新增] Memory Mismatch Ranking Loss (Anti-Bypass)
+  # 核心功能：防止 Solver 绕过 Memory 依靠语言先验"瞎编"细节
+  # 原理：如果在"错误 Memory"下也能流畅生成，说明 Solver 在走捷径
+  # 公式：L_rank = max(0, gamma + L_pos - L_neg)
+  # 总损失：L = L_ce + beta * L_rank
+  use_mmr_loss: true               # [强烈推荐] 启用 Anti-Bypass Loss
+  mmr_gamma: 0.5                   # Ranking Loss 的 margin 参数
+  mmr_beta: 0.5                    # Ranking Loss 的最终目标权重
+  mmr_beta_start: 0.1              # Beta warmup 起始值（训练初期用较小权重）
+  mmr_beta_warmup_steps: 150       # Beta warmup 步数（从 0.1 线性增长到 0.5）
+
+# 数据配置
+data:
+  train_json: "/mnt/cephszjt/user_juntianzhang/ColaMem/data/ShareGPT4V/colamem_train.json"  
+  eval_json: "/mnt/cephszjt/user_juntianzhang/ColaMem/data/ShareGPT4V/colamem_val.json"    # 评估数据（可选）
+
+# 训练配置
+training:
+  output_dir: "./outputs/colamem_phase1.5"
+  
+  # ⚠️ 训练参数 - Phase 1 关键设置
+  num_epochs: 2                    # 从上次 checkpoint 继续，需要增加到 2 epoch
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8   # 有效 batch_size = 2 * 8 * num_gpus
+  
+  # 优化器参数
+  # 注意：由于冻结了 Decoder，实际只训练 Encoder LLM + Projector + Memory 相关参数
+  learning_rate: 1.0e-5            
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  
+  # 精度参数
+  bf16: true
+  fp16: false
+  
+  # 日志参数
+  logging_steps: 20
+  
+  # 保存参数 - Phase 1 只跑 1 epoch，适当调整
+  save_steps: 200                  # 每 500 步保存一次
+  save_total_limit: 3
+  eval_steps: 200
+  
+  # 数据加载参数
+  num_workers: 4
+  
+  # DeepSpeed 配置（必需！）
+  deepspeed_config: "configs/ds_zero3_config.json"
+  
+  # 报告工具
+  report_to: ["tensorboard"]
+  
+  # 语义漂移监控（高级特性）
+  monitor_drift_every_n_steps: 100  # 每 500 步监控一次
+  save_drift_report: true           # 保存漂移报告
+  
+  # 恢复训练（从上次 checkpoint 继续）
+  resume_from_checkpoint: "/mnt/cephszjt/user_juntianzhang/ColaMem_v1/outputs/colamem_phase1/checkpoint-352"
+
+# 随机种子
+seed: 42

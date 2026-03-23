@@ -1,0 +1,189 @@
+# ColaMem Training Configuration - Phase 1 (LoRA 版本)
+# 图像描述重建任务（Captioning/Reconstruction）
+# 
+# 🎯 LoRA 微调模式
+# 相比全参数微调的优势：
+#   - 可训练参数从 ~8B 降到 ~25M（减少 99.7%）
+#   - 训练显存从 ~170GB 降到 ~40GB
+#   - 可以使用 DeepSpeed ZeRO-2 或 DDP（无需 ZeRO-3）
+#   - 训练速度更快
+#   - 性能接近全参数微调
+# 
+# ⚠️ Phase 1 训练策略核心要点：
+# 1. 只跑 1-2 个 Epoch，防止过拟合（变成复读机）
+# 2. 使用 LoRA 微调 Encoder LLM + Decoder LLM
+# 3. 目标：Loss 从 ~2.0 降到 ~0.8，模型能大致说对图片内容
+# 4. 不追求完美语法，只要不复读、不乱码即可
+
+# 模型配置
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"  
+  # [Phase 1 修复] 基础模型路径，用于加载 Vision Encoder 预训练权重
+  # 如果不设置，默认使用 model_path
+  base_model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  num_mem_tokens: 64               
+  num_work_tokens: 32              
+  
+  # [Phase 1 专用] 禁用 Workspace（强烈推荐！）
+  # 原因：
+  #   - Phase 1 是简单的 Captioning 任务，不需要"草稿纸"进行推理
+  #   - 禁用 Workspace 可以简化学习目标，让 Projector 专注于对齐
+  #   - 减少参数量（~131K），避免梯度稀释
+  #   - 防止模型走捷径（把信息存在 workspace 而非 latent_memory）
+  # Phase 2/3 可启用 Workspace 进行复杂推理
+  use_workspace: false
+  
+  # [重要修复] 禁用 gradient_checkpointing
+  # 原因：Qwen3-VL 的 M-RoPE 缓存机制与 gradient checkpointing 不兼容
+  # 错误表现：forward 时 RoPE 缓存 [4096] -> recompute 时变成 [0]
+  # LoRA 模式下显存压力小，可以安全禁用
+  gradient_checkpointing: false     
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  
+  # [重要] 冻结 Vision Encoder（推荐开启）
+  # 优势：避免权重加载问题、节省显存、加快训练、保留预训练视觉能力
+  freeze_vision_encoder: true
+  
+  # [LoRA 模式] 不需要冻结 Decoder，因为 LoRA 只训练适配器
+  # 设置为 false，让 Decoder 的 LoRA 适配器参与训练
+  freeze_decoder: false
+
+  use_semantic_init: true          # 多样化语义初始化（统一概念词池，无分组）
+  lambda_orth: 0.08                # 正交正则化权重（防止模式坍塌，只惩罚 off-diagonal）
+  orth_warmup_steps: 100           # 正交正则化 warmup 步数（前 100 步 lambda 从 0 线性增长）
+  # [Phase 1 新增] Memory Mismatch Ranking Loss (Anti-Bypass)
+  # 核心功能：防止 Solver 绕过 Memory 依靠语言先验"瞎编"细节
+  # 原理：如果在"错误 Memory"下也能流畅生成，说明 Solver 在走捷径
+  # 公式：L_rank = max(0, gamma + L_pos - L_neg)
+  # 总损失：L = L_ce + beta * L_rank
+  use_mmr_loss: true               # [强烈推荐] 启用 Anti-Bypass Loss
+  mmr_gamma: 0.5                   # Ranking Loss 的 margin 参数
+  mmr_beta: 0.5                    # Ranking Loss 的最终目标权重
+  mmr_beta_start: 0.1              # Beta warmup 起始值（训练初期用较小权重）
+  mmr_beta_warmup_steps: 150       # Beta warmup 步数（从 0.1 线性增长到 0.5）
+
+  # ==========================================================================
+  # 🛡️ Answer-Prefix Dropout (Anti-Bypass 增强)
+  # ==========================================================================
+  # 训练时随机 mask 掉 answer 前 K 个 token 的 embedding，
+  # 迫使 decoder 不能靠「看到答案开头就猜出后续」来绕过 memory。
+  # 这是防止 bypass 最优先级最高的手段。
+  use_answer_prefix_dropout: true  # 是否启用（true/false）
+  answer_prefix_dropout_ratio: 0.3  # 被 mask 的 answer 前缀比例（0.0~1.0）
+  answer_prefix_dropout_prob: 0.5   # 每个 batch 触发 dropout 的概率（0.0~1.0）
+
+  # ==========================================================================
+  # 🎯 LoRA 配置（支持 encoder 和 decoder 独立配置）
+  # ==========================================================================
+  use_lora: true                   # 启用 LoRA 微调模式
+  
+  # ---------- Encoder LoRA 配置 ----------
+  # Encoder 负责压缩上下文信息到 Latent Memory
+  # 通常需要较大的 rank 来保留更多信息
+  encoder_lora: true               # 对 Encoder 应用 LoRA
+  encoder_lora_r: 64               # Encoder LoRA rank (推荐 16-64)
+  encoder_lora_alpha: 128           # Encoder LoRA alpha (通常设为 2*r)
+  encoder_lora_dropout: 0.05       # Encoder LoRA dropout
+  encoder_lora_target_modules:     # Encoder LoRA 目标模块
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  
+  # ---------- Decoder LoRA 配置 ----------
+  # Decoder 负责从 Latent Memory 生成回答
+  # 可以使用较小的 rank，因为它主要是生成任务
+  decoder_lora: true               # 对 Decoder 应用 LoRA
+  decoder_lora_r: 16               # Decoder LoRA rank (推荐 8-32)
+  decoder_lora_alpha: 32           # Decoder LoRA alpha (通常设为 2*r)
+  decoder_lora_dropout: 0.05       # Decoder LoRA dropout
+  decoder_lora_target_modules:     # Decoder LoRA 目标模块
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  # ==========================================================================
+
+# 数据配置
+data:
+  train_json: "/mnt/cephszjt/user_juntianzhang/ColaMem/data/ShareGPT4V/colamem_train.json"  
+  eval_json: "/mnt/cephszjt/user_juntianzhang/ColaMem/data/ShareGPT4V/colamem_val.json"    # 评估数据（可选）
+
+# 训练配置
+training:
+  output_dir: "./outputs/colamem_phase0.1_lora"
+  
+  # ⚠️ 训练参数 - LoRA 模式调整
+  num_epochs: 2                    # LoRA 模式可以多训练几个 epoch
+  per_device_train_batch_size: 4   # LoRA 模式显存占用小，可以增大 batch_size
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4   # 有效 batch_size = 4 * 4 * num_gpus
+  
+  # 优化器参数
+  # LoRA 模式下可以使用稍大的学习率
+  learning_rate: 2.0e-4            # 默认学习率（如果未设置 encoder_lr / decoder_lr 则统一使用）
+  
+  # ⭐ Encoder / Decoder 独立学习率（可选）
+  # 设置后将覆盖 learning_rate 对应组件的学习率
+  # 不设置则 encoder 和 decoder 统一使用 learning_rate
+  # 建议：Encoder (Compressor) 使用较大学习率促进信息压缩
+  #       Decoder (Solver) 使用较小学习率保持生成能力
+  encoder_lr: 2.0e-4               # Encoder (Compressor) 学习率
+  decoder_lr: 2.0e-5               # Decoder (Solver) 学习率
+  
+  # ⭐ 自定义组件独立学习率
+  # 设置后将直接使用指定值，不再根据 encoder_lr 倍率计算
+  # 不设置则按默认倍率自动计算
+  #
+  # 🎯 推荐学习率设计理由：
+  #   anchors_lr   = 6e-4  (3x encoder) — 语义初始化起点好，无需太激进；5x 容易漂移过快
+  #   projector_lr = 4e-4  (2x encoder) — 随机初始化需要较大 lr 快速对齐空间
+  #   gate_lr      = 1e-4  (0.5x encoder) — sigmoid 放大梯度 + 只有64个标量，过大易震荡
+  #   scale_lr     = 5e-5  (0.25x encoder) — 单标量影响全局尺度，必须极保守
+  anchors_lr: 6.0e-4               # mem_anchors / work_tokens 学习率
+  projector_lr: 4.0e-4             # Projector 学习率
+  gate_lr: 1.0e-4                  # residual_gate_logit 学习率
+  scale_lr: 5.0e-5                 # memory_scale 学习率
+  
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  
+  # 精度参数
+  bf16: true
+  fp16: false
+  
+  # 日志参数
+  logging_steps: 20
+  
+  # 保存参数
+  save_steps: 100
+  save_total_limit: 5
+  eval_steps: 200
+  
+  # 数据加载参数
+  num_workers: 4
+  
+  # DeepSpeed 配置
+  # LoRA 模式推荐使用 ZeRO-2（比 ZeRO-3 更快）
+  deepspeed_config: "configs/ds_config_zero2.json"
+  
+  # 报告工具
+  report_to: ["tensorboard"]
+  
+  # 语义漂移监控（高级特性）
+  monitor_drift_every_n_steps: 200
+  save_drift_report: true
+  
+  # 恢复训练（如需继续训练，设置此参数）
+  #resume_from_checkpoint: "./outputs/colamem_phase1_lora/checkpoint-100"
+
+# 随机种子
+seed: 42
